@@ -38,6 +38,8 @@ pub struct EvdevListener {
     profile_modifiers: HashMap<Key, String>,
     /// Double-tap latch enabled (push_to_talk only)
     double_tap_latch: bool,
+    /// Modifier keys that pick the Whisper language for one recording
+    language_modifiers: HashMap<Key, String>,
     /// Signal to stop the listener task
     stop_signal: Option<oneshot::Sender<()>>,
 }
@@ -81,6 +83,12 @@ impl EvdevListener {
             .map(|(k, v)| Ok((parse_key_name(k)?, v.clone())))
             .collect::<Result<HashMap<Key, String>, HotkeyError>>()?;
 
+        let language_modifiers = config
+            .language_modifiers
+            .iter()
+            .map(|(k, v)| Ok((parse_key_name(k)?, v.clone())))
+            .collect::<Result<HashMap<Key, String>, HotkeyError>>()?;
+
         // Warn if profile modifier keys overlap with required modifiers or model modifier
         for (key, profile_name) in &profile_modifiers {
             if modifier_keys.contains(key) {
@@ -114,6 +122,7 @@ impl EvdevListener {
             secondary_model: None, // Set later via set_secondary_model
             profile_modifiers,
             double_tap_latch: config.double_tap_latch && config.mode == ActivationMode::PushToTalk,
+            language_modifiers,
             stop_signal: None,
         })
     }
@@ -138,6 +147,7 @@ impl HotkeyListener for EvdevListener {
         let secondary_model = self.secondary_model.clone();
         let profile_modifiers = self.profile_modifiers.clone();
         let tap_latch = self.double_tap_latch.then(TapLatch::default);
+        let language_modifiers = self.language_modifiers.clone();
 
         // Open the keyboards here rather than in the task, so a daemon with
         // no usable keyboard (most often a missing 'input' group) gets the
@@ -156,6 +166,7 @@ impl HotkeyListener for EvdevListener {
         }
         watched_keys.extend(model_modifier);
         watched_keys.extend(profile_modifiers.keys().copied());
+        watched_keys.extend(language_modifiers.keys().copied());
         let manager = DeviceManager::new(watched_keys)?;
 
         // Spawn the listener task
@@ -170,6 +181,7 @@ impl HotkeyListener for EvdevListener {
                 secondary_model,
                 profile_modifiers,
                 tap_latch,
+                language_modifiers,
                 tx,
                 stop_rx,
             ) {
@@ -643,6 +655,7 @@ fn evdev_listener_loop(
     secondary_model: Option<String>,
     profile_modifiers: HashMap<Key, String>,
     mut tap_latch: Option<TapLatch>,
+    language_modifiers: HashMap<Key, String>,
     tx: mpsc::Sender<HotkeyEvent>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), HotkeyError> {
@@ -661,6 +674,15 @@ fn evdev_listener_loop(
 
     // Track if we're currently "pressed" (to handle repeat events)
     let mut is_pressed = false;
+
+    // Language picked by a held language modifier; applied when the hotkey
+    // goes down, or straight away if it goes down during a recording.
+    let mut held_language: Option<String> = None;
+    let set_language = |lang: Option<String>| {
+        if let Ok(mut guard) = crate::transcribe::whisper::LANGUAGE_OVERRIDE.lock() {
+            *guard = lang;
+        }
+    };
 
     if let Some(cancel) = cancel_key {
         tracing::info!(
@@ -816,6 +838,20 @@ fn evdev_listener_loop(
                 }
             }
 
+            if let Some(lang) = language_modifiers.get(&key) {
+                match value {
+                    1 => {
+                        held_language = Some(lang.clone());
+                        if is_pressed {
+                            tracing::debug!("Language {} picked during recording", lang);
+                            set_language(Some(lang.clone()));
+                        }
+                    }
+                    0 => held_language = None,
+                    _ => {}
+                }
+            }
+
             // Check cancel key first (if configured)
             if let Some(cancel) = cancel_key {
                 if key == cancel && value == 1 {
@@ -836,8 +872,14 @@ fn evdev_listener_loop(
                 match target_key_action(value, is_pressed, modifiers_satisfied) {
                     TargetKeyAction::Press => {
                         is_pressed = true;
+                        let tap = tap_latch.as_mut().map(|l| l.press(Instant::now()));
+                        // A tap that latches or stops a recording keeps the
+                        // language it started with unless a modifier is held.
+                        if held_language.is_some() || matches!(tap, Some(TapAction::Pass) | None) {
+                            set_language(held_language.clone());
+                        }
 
-                        match tap_latch.as_mut().map(|l| l.press(Instant::now())) {
+                        match tap {
                             Some(TapAction::Swallow) => {
                                 tracing::debug!("Double tap, recording latched");
                                 continue;

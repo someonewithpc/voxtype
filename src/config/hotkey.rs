@@ -71,6 +71,12 @@ pub struct HotkeyConfig {
     /// A single short tap is discarded instead of transcribed.
     #[serde(default)]
     pub double_tap_latch: bool,
+    /// Modifier keys that pick the Whisper language for one recording,
+    /// skipping language detection. Held when the hotkey goes down, or
+    /// pressed any time before the recording stops.
+    /// Example: { "RIGHTSHIFT" = "pt" }
+    #[serde(default)]
+    pub language_modifiers: HashMap<String, String>,
 }
 
 impl Default for HotkeyConfig {
@@ -85,6 +91,7 @@ impl Default for HotkeyConfig {
             model_modifier: None,
             profile_modifiers: HashMap::new(),
             double_tap_latch: false,
+            language_modifiers: HashMap::new(),
         }
     }
 }
@@ -237,5 +244,39 @@ mod tests {
 
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.hotkey.profile_modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_language_modifiers() {
+        let toml_str = r#"
+            [hotkey]
+            key = "RIGHTCTRL"
+
+            [hotkey.language_modifiers]
+            RIGHTSHIFT = "pt"
+
+            [audio]
+            device = "default"
+            sample_rate = 16000
+            max_duration_secs = 60
+
+            [whisper]
+            model = "base.en"
+            language = "en"
+
+            [output]
+            mode = "type"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config
+                .hotkey
+                .language_modifiers
+                .get("RIGHTSHIFT")
+                .map(String::as_str),
+            Some("pt")
+        );
+        assert!(HotkeyConfig::default().language_modifiers.is_empty());
     }
 }
