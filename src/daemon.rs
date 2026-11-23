@@ -1252,6 +1252,68 @@ struct DeferredOutput {
     /// Its history entry, committed once the text is delivered
     history: Option<crate::history::recorder::Pending>,
     archive: Option<crate::archive::Entry>,
+    /// The Hyprland window the dictation started in
+    target: Option<String>,
+}
+
+/// The address of the Hyprland window with focus.
+fn hyprland_active_window() -> Option<String> {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let out = std::process::Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("address")?.as_str().map(String::from)
+}
+
+/// Give focus back to `target` if another window (a password prompt, say)
+/// took it since the dictation started. False when focus is still
+/// elsewhere afterwards, so the text must not be pasted.
+fn refocus(target: Option<&str>) -> bool {
+    let Some(target) = target else {
+        return true;
+    };
+    if hyprland_active_window().as_deref() == Some(target) {
+        return true;
+    }
+    tracing::info!(
+        "Focus moved during the dictation; returning it to {}",
+        target
+    );
+    // A Lua config takes a Lua expression, a hyprlang one `focuswindow`.
+    for args in [
+        vec![
+            "dispatch".to_string(),
+            format!("hl.dsp.focus({{ window = \"address:{target}\" }})"),
+        ],
+        vec![
+            "dispatch".to_string(),
+            "focuswindow".to_string(),
+            format!("address:{target}"),
+        ],
+    ] {
+        let _ = std::process::Command::new("hyprctl").args(&args).output();
+        if hyprland_active_window().as_deref() == Some(target) {
+            return true;
+        }
+    }
+    tracing::warn!("Couldn't return focus to {}; not pasting", target);
+    false
+}
+
+/// Put `text` on the clipboard when it can't be pasted.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    if let Ok(mut child) = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 /// How a dictation's output ended, for the archive and the failure command.
@@ -1387,6 +1449,9 @@ pub struct Daemon {
     deferred_output: Option<DeferredOutput>,
     /// The archive entry of the dictation being transcribed or delivered
     archive: Option<crate::archive::Entry>,
+    /// The Hyprland windows the recording and the transcription started in
+    recording_target: Option<String>,
+    transcribing_target: Option<String>,
     hotkey_down: bool,
     // Transcriber Arc used for the in-flight transcription_task. Held so the
     // result handler can query language metadata (e.g. detected language for
@@ -1705,6 +1770,8 @@ impl Daemon {
             standby_capture: None,
             deferred_output: None,
             archive: None,
+            recording_target: None,
+            transcribing_target: None,
             hotkey_down: false,
             active_transcriber: None,
             #[cfg(test)]
@@ -5802,8 +5869,14 @@ impl Daemon {
         // it is delivered.
         let current = self.history_swap(deferred.history);
         let current_archive = std::mem::replace(&mut self.archive, deferred.archive);
-        self.deliver_dictation(&deferred.config, &deferred.text, &deferred.original, false)
-            .await;
+        self.deliver_dictation(
+            &deferred.config,
+            &deferred.text,
+            &deferred.original,
+            deferred.target.as_deref(),
+            false,
+        )
+        .await;
         self.archive = current_archive;
         if let Some(finished) = self.history_swap(current) {
             self.history_commit_pending(finished);
@@ -5818,8 +5891,22 @@ impl Daemon {
         output_config: &crate::config::OutputConfig,
         final_text: &str,
         original: &str,
+        target: Option<&str>,
         osd: bool,
     ) {
+        if !refocus(target) {
+            copy_to_clipboard(final_text);
+            self.history_note(|p| {
+                p.outcome(
+                    crate::history::Outcome::OutputFailed,
+                    Some("focus moved to another window".into()),
+                )
+            });
+            crate::archive::finish(self.archive.as_mut(), "focus-lost");
+            self.archive = None;
+            return;
+        }
+
         #[cfg(test)]
         let output_chain = match self.history_test_output_chain.take() {
             Some(chain) => chain,
@@ -5987,7 +6074,12 @@ impl Daemon {
                         .lock()
                         .ok()
                         .and_then(|g| g.clone());
-                    self.archive = crate::archive::Entry::start(&samples, language);
+                    self.transcribing_target = self.recording_target.take();
+                    self.archive = crate::archive::Entry::start(
+                        &samples,
+                        language,
+                        self.transcribing_target.clone(),
+                    );
                     *state = State::Transcribing {
                         audio: samples.clone(),
                     };
@@ -6500,6 +6592,7 @@ impl Daemon {
                             original: text.clone(),
                             history,
                             archive: self.archive.take(),
+                            target: self.transcribing_target.take(),
                         });
                         *state = State::Idle;
                         self.update_state("idle");
@@ -6509,8 +6602,15 @@ impl Daemon {
                     *state = State::Outputting {
                         text: final_text.clone(),
                     };
-                    self.deliver_dictation(&output_config, &final_text, &text, true)
-                        .await;
+                    let target = self.transcribing_target.take();
+                    self.deliver_dictation(
+                        &output_config,
+                        &final_text,
+                        &text,
+                        target.as_deref(),
+                        true,
+                    )
+                    .await;
 
                     *state = State::Idle;
                     self.update_state("idle");
@@ -7202,6 +7302,7 @@ impl Daemon {
                                 continue;
                             }
                             if state.is_idle() {
+                                self.recording_target = hyprland_active_window();
                                 if !self.accept_model_override(model_override.as_deref()).await {
                                     continue;
                                 }

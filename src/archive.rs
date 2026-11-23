@@ -21,7 +21,11 @@ pub struct Entry {
 impl Entry {
     /// Write the audio and an initial sidecar. Returns `None` when archiving
     /// is off or the files can't be written (logged).
-    pub fn start(samples: &[f32], language: Option<String>) -> Option<Self> {
+    pub fn start(
+        samples: &[f32],
+        language: Option<String>,
+        target_window: Option<String>,
+    ) -> Option<Self> {
         let root = PathBuf::from(std::env::var_os("VOXTYPE_ARCHIVE_DIR")?);
         let now = chrono::Local::now();
         let dir = root.join(now.format("%Y-%m-%d").to_string());
@@ -47,6 +51,7 @@ impl Entry {
             json!(samples.len() as f64 / 16000.0),
         );
         meta.insert("language".into(), json!(language));
+        meta.insert("target_window".into(), json!(target_window));
         let entry = Self {
             json_path: dir.join(format!("{stem}.json")),
             meta,
