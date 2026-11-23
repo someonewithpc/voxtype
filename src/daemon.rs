@@ -1251,6 +1251,28 @@ struct DeferredOutput {
     original: String,
     /// Its history entry, committed once the text is delivered
     history: Option<crate::history::recorder::Pending>,
+    archive: Option<crate::archive::Entry>,
+}
+
+/// How a dictation's output ended, for the archive and the failure command.
+fn delivery_outcome<E>(
+    mode: &crate::config::OutputMode,
+    delivery: &std::result::Result<output::Delivered, E>,
+) -> &'static str {
+    let Ok(delivered) = delivery else {
+        return "output-failed";
+    };
+    if delivered.driver.starts_with("clipboard") {
+        if *mode == crate::config::OutputMode::Clipboard {
+            "pasted"
+        } else {
+            "clipboard"
+        }
+    } else if delivered.driver.starts_with("paste") || *mode != crate::config::OutputMode::Paste {
+        "pasted"
+    } else {
+        "typed"
+    }
 }
 
 /// Main daemon that orchestrates all components
@@ -1363,6 +1385,8 @@ pub struct Daemon {
     // `deferred_output` until the release, so it doesn't land mid-sentence.
     standby_capture: Option<Box<dyn AudioCapture>>,
     deferred_output: Option<DeferredOutput>,
+    /// The archive entry of the dictation being transcribed or delivered
+    archive: Option<crate::archive::Entry>,
     hotkey_down: bool,
     // Transcriber Arc used for the in-flight transcription_task. Held so the
     // result handler can query language metadata (e.g. detected language for
@@ -1680,6 +1704,7 @@ impl Daemon {
             transcription_task: None,
             standby_capture: None,
             deferred_output: None,
+            archive: None,
             hotkey_down: false,
             active_transcriber: None,
             #[cfg(test)]
@@ -5776,8 +5801,10 @@ impl Daemon {
         // Its history entry stands in for the recording's in progress while
         // it is delivered.
         let current = self.history_swap(deferred.history);
+        let current_archive = std::mem::replace(&mut self.archive, deferred.archive);
         self.deliver_dictation(&deferred.config, &deferred.text, &deferred.original, false)
             .await;
+        self.archive = current_archive;
         if let Some(finished) = self.history_swap(current) {
             self.history_commit_pending(finished);
         }
@@ -5814,6 +5841,11 @@ impl Daemon {
 
         let (report, delivery) =
             output::output_with_fallback_report(&output_chain, final_text, output_options).await;
+        crate::archive::finish(
+            self.archive.as_mut(),
+            delivery_outcome(&output_config.mode, &delivery),
+        );
+        self.archive = None;
         {
             use crate::history::{Outcome, OutputInfo};
             let mode = format!("{:?}", output_config.mode).to_lowercase();
@@ -5951,6 +5983,11 @@ impl Daemon {
                     }
 
                     tracing::info!("Transcribing {:.1}s of audio...", audio_duration);
+                    let language = crate::transcribe::whisper::LANGUAGE_OVERRIDE
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    self.archive = crate::archive::Entry::start(&samples, language);
                     *state = State::Transcribing {
                         audio: samples.clone(),
                     };
@@ -6447,6 +6484,11 @@ impl Daemon {
                         }
                     }
 
+                    if let Some(archive) = self.archive.as_mut() {
+                        archive.set("raw", text.clone());
+                        archive.set("text", final_text.clone());
+                    }
+
                     if self.pipelines_dictation() && self.hotkey_down {
                         tracing::info!(
                             "Hotkey held for the next dictation; output waits for the release"
@@ -6457,6 +6499,7 @@ impl Daemon {
                             text: final_text,
                             original: text.clone(),
                             history,
+                            archive: self.archive.take(),
                         });
                         *state = State::Idle;
                         self.update_state("idle");
@@ -6475,6 +6518,8 @@ impl Daemon {
             }
             Ok(Err(e)) => {
                 tracing::error!("Transcription failed: {}", e);
+                crate::archive::finish(self.archive.as_mut(), "transcription-failed");
+                self.archive = None;
                 self.history_note(|p| {
                     p.outcome(
                         crate::history::Outcome::TranscriptionFailed,
