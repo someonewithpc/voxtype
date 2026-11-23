@@ -516,6 +516,14 @@ pub fn create_output_chain_with_override(
             // notified that it was "copied to clipboard". Mirror Type mode's
             // fallback_to_clipboard behavior so the text still reaches the
             // user's clipboard.
+            //
+            // A paste that fails for another reason types the text instead.
+            #[cfg(not(target_os = "macos"))]
+            chain.extend(create_driver_output(
+                OutputDriver::Wtype,
+                config,
+                pre_type_delay_ms,
+            ));
             #[cfg(target_os = "macos")]
             if config.fallback_to_clipboard {
                 chain.push(Box::new(pbcopy::PbcopyOutput::new(false)));
@@ -962,6 +970,7 @@ mod tests {
             names,
             vec![
                 "paste (clipboard + keystroke)",
+                "wtype",
                 "clipboard (wl-copy)",
                 "clipboard (xclip/xsel)",
             ]
@@ -980,7 +989,7 @@ mod tests {
             .iter()
             .map(|o| o.name())
             .collect();
-        assert_eq!(names, vec!["paste (clipboard + keystroke)"]);
+        assert_eq!(names, vec!["paste (clipboard + keystroke)", "wtype"]);
     }
 
     #[test]
